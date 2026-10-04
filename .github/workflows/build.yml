@@ -1,0 +1,431 @@
+name: Build NguonC
+
+# Chạy tự động khi tạo file này, và mỗi khi bạn sửa code. Có thể bấm chạy tay ở tab Actions.
+on:
+  push:
+    branches-ignore: [builds]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tạo source code (chỉ lần đầu)
+        run: |
+          if [ ! -d NguonC ]; then
+          cat > build.gradle.kts <<'NGUONC_EOF'
+          import com.android.build.gradle.BaseExtension
+          import com.lagradost.cloudstream3.gradle.CloudstreamExtension
+          import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+          import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
+
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven("https://jitpack.io")
+              }
+              dependencies {
+                  classpath("com.android.tools.build:gradle:8.7.3")
+                  classpath("com.github.recloudstream:gradle:-SNAPSHOT")
+                  classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
+              }
+          }
+
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven("https://jitpack.io")
+              }
+          }
+
+          fun Project.cloudstream(configuration: CloudstreamExtension.() -> Unit) =
+              extensions.getByName<CloudstreamExtension>("cloudstream").configuration()
+
+          fun Project.android(configuration: BaseExtension.() -> Unit) =
+              extensions.getByName<BaseExtension>("android").configuration()
+
+          subprojects {
+              apply(plugin = "com.android.library")
+              apply(plugin = "kotlin-android")
+              apply(plugin = "com.lagradost.cloudstream3.gradle")
+
+              cloudstream {
+                  setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/user/repo")
+              }
+
+              android {
+                  namespace = "recloudstream"
+                  defaultConfig {
+                      minSdk = 21
+                      compileSdkVersion(35)
+                      targetSdk = 35
+                  }
+                  compileOptions {
+                      sourceCompatibility = JavaVersion.VERSION_1_8
+                      targetCompatibility = JavaVersion.VERSION_1_8
+                  }
+                  tasks.withType<KotlinJvmCompile> {
+                      compilerOptions {
+                          jvmTarget.set(JvmTarget.JVM_1_8)
+                          freeCompilerArgs.addAll(
+                              "-Xno-call-assertions",
+                              "-Xno-param-assertions",
+                              "-Xno-receiver-assertions"
+                          )
+                      }
+                  }
+              }
+
+              dependencies {
+                  val implementation by configurations
+                  implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
+                  implementation(kotlin("stdlib"))
+                  implementation("com.github.Blatzar:NiceHttp:0.4.11")
+                  implementation("org.jsoup:jsoup:1.18.3")
+                  // Không nâng Jackson quá 2.13.1 (lỗi trên Android cũ)
+                  implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
+              }
+          }
+
+          task<Delete>("clean") {
+              delete(rootProject.layout.buildDirectory)
+          }
+          NGUONC_EOF
+          cat > settings.gradle.kts <<'NGUONC_EOF'
+          rootProject.name = "NguonCPlugins"
+
+          include("NguonC")
+          NGUONC_EOF
+          cat > gradle.properties <<'NGUONC_EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          NGUONC_EOF
+          cat > .gitignore <<'NGUONC_EOF'
+          build/
+          .gradle/
+          local.properties
+          *.cs3
+          NGUONC_EOF
+          mkdir -p NguonC
+          cat > NguonC/build.gradle.kts <<'NGUONC_EOF'
+          // Tăng version mỗi lần sửa code để app nhận bản cập nhật
+          version = 1
+
+          cloudstream {
+              description = "Xem phim từ phim.nguonc.com"
+              authors = listOf("YourName")
+
+              // 0: Down, 1: Ok, 2: Slow, 3: Beta
+              status = 1
+              tvTypes = listOf("Movie", "TvSeries", "Anime", "Cartoon")
+              requiresResources = false
+              language = "vi"
+              iconUrl = "https://www.google.com/s2/favicons?domain=phim.nguonc.com&sz=128"
+          }
+          NGUONC_EOF
+          mkdir -p NguonC/src/main
+          cat > NguonC/src/main/AndroidManifest.xml <<'NGUONC_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application />
+          </manifest>
+          NGUONC_EOF
+          mkdir -p NguonC/src/main/kotlin/com/nguonc
+          cat > NguonC/src/main/kotlin/com/nguonc/NguonCPlugin.kt <<'NGUONC_EOF'
+          package com.nguonc
+
+          import com.lagradost.cloudstream3.plugins.BasePlugin
+          import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+
+          @CloudstreamPlugin
+          class NguonCPlugin : BasePlugin() {
+              override fun load() {
+                  registerMainAPI(NguonCProvider())
+              }
+          }
+          NGUONC_EOF
+          mkdir -p NguonC/src/main/kotlin/com/nguonc
+          cat > NguonC/src/main/kotlin/com/nguonc/NguonCProvider.kt <<'NGUONC_EOF'
+          package com.nguonc
+
+          import com.fasterxml.jackson.annotation.JsonProperty
+          import com.lagradost.cloudstream3.*
+          import com.lagradost.cloudstream3.utils.*
+          import com.lagradost.cloudstream3.utils.AppUtils.parsedSafe
+          import com.lagradost.cloudstream3.utils.AppUtils.toJson
+          import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+          import org.jsoup.Jsoup
+
+          class NguonCProvider : MainAPI() {
+              override var mainUrl = "https://phim.nguonc.com"
+              override var name = "NguonC"
+              override var lang = "vi"
+              override val hasMainPage = true
+              override val supportedTypes = setOf(
+                  TvType.Movie, TvType.TvSeries, TvType.Anime, TvType.Cartoon
+              )
+
+              // Mỗi mục = 1 đường dẫn API /api/films/<data>?page=N (tự phân trang vô hạn)
+              override val mainPage = mainPageOf(
+                  "phim-moi-cap-nhat" to "Phim mới cập nhật",
+                  "danh-sach/phim-le" to "Phim lẻ",
+                  "danh-sach/phim-bo" to "Phim bộ",
+                  "danh-sach/hoat-hinh" to "Hoạt hình",
+                  "danh-sach/tv-shows" to "TV Shows",
+                  "danh-sach/phim-dang-chieu" to "Phim đang chiếu",
+                  "quoc-gia/han-quoc" to "Hàn Quốc",
+                  "quoc-gia/trung-quoc" to "Trung Quốc",
+                  "quoc-gia/au-my" to "Âu Mỹ",
+                  "quoc-gia/nhat-ban" to "Nhật Bản",
+                  "quoc-gia/thai-lan" to "Thái Lan",
+                  "quoc-gia/viet-nam" to "Việt Nam",
+                  "the-loai/hanh-dong" to "Hành động",
+                  "the-loai/tinh-cam" to "Tình cảm",
+                  "the-loai/hai-huoc" to "Hài hước",
+                  "the-loai/co-trang" to "Cổ trang",
+                  "the-loai/kinh-di" to "Kinh dị",
+                  "the-loai/vien-tuong" to "Viễn tưởng",
+              )
+
+              // ---------- Data models ----------
+              data class Paginate(
+                  @JsonProperty("current_page") val currentPage: Int? = null,
+                  @JsonProperty("total_page") val totalPage: Int? = null,
+              )
+
+              data class Item(
+                  @JsonProperty("name") val name: String? = null,
+                  @JsonProperty("slug") val slug: String? = null,
+                  @JsonProperty("thumb_url") val thumb: String? = null,
+                  @JsonProperty("poster_url") val poster: String? = null,
+                  @JsonProperty("total_episodes") val totalEpisodes: Int? = null,
+              )
+
+              data class ListResponse(
+                  @JsonProperty("paginate") val paginate: Paginate? = null,
+                  @JsonProperty("items") val items: List<Item>? = null,
+              )
+
+              data class Link(
+                  @JsonProperty("name") val name: String? = null,
+                  @JsonProperty("embed") val embed: String? = null,
+                  @JsonProperty("m3u8") val m3u8: String? = null,
+              )
+
+              data class Server(
+                  @JsonProperty("server_name") val serverName: String? = null,
+                  @JsonProperty("items") val items: List<Link>? = null,
+              )
+
+              data class Movie(
+                  @JsonProperty("name") val name: String? = null,
+                  @JsonProperty("original_name") val originalName: String? = null,
+                  @JsonProperty("slug") val slug: String? = null,
+                  @JsonProperty("thumb_url") val thumb: String? = null,
+                  @JsonProperty("poster_url") val poster: String? = null,
+                  @JsonProperty("description") val description: String? = null,
+                  @JsonProperty("total_episodes") val totalEpisodes: Int? = null,
+                  @JsonProperty("time") val time: String? = null,
+                  @JsonProperty("casts") val casts: String? = null,
+                  @JsonProperty("category") val category: Any? = null,
+                  @JsonProperty("episodes") val episodes: List<Server>? = null,
+              )
+
+              data class DetailResponse(@JsonProperty("movie") val movie: Movie? = null)
+
+              // Dữ liệu gửi sang loadLinks (gom các server của cùng 1 tập)
+              data class EpLink(val server: String, val embed: String?, val m3u8: String?)
+
+              // ---------- Helpers ----------
+              private fun Item.toSearch(): SearchResponse? {
+                  val slug = slug ?: return null
+                  val title = name ?: return null
+                  val url = "$mainUrl/phim/$slug"
+                  val img = fixUrlNull(thumb ?: poster)
+                  return if ((totalEpisodes ?: 1) > 1) {
+                      newTvSeriesSearchResponse(title, url, TvType.TvSeries) { posterUrl = img }
+                  } else {
+                      newMovieSearchResponse(title, url, TvType.Movie) { posterUrl = img }
+                  }
+              }
+
+              // category có thể là map {"1":{group:{name}, list:[{name}]}, ...}
+              private fun parseCategory(raw: Any?): Map<String, List<String>> {
+                  val out = mutableMapOf<String, List<String>>()
+                  val groups = when (raw) {
+                      is Map<*, *> -> raw.values
+                      is Collection<*> -> raw
+                      else -> return out
+                  }
+                  for (g in groups) {
+                      val m = g as? Map<*, *> ?: continue
+                      val gname = (m["group"] as? Map<*, *>)?.get("name") as? String ?: continue
+                      val names = (m["list"] as? Collection<*>)
+                          ?.mapNotNull { (it as? Map<*, *>)?.get("name") as? String }
+                          .orEmpty()
+                      out[gname] = names
+                  }
+                  return out
+              }
+
+              // ---------- Main page / search ----------
+              override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+                  val res = app.get("$mainUrl/api/films/${request.data}?page=$page")
+                      .parsedSafe<ListResponse>()
+                  val items = res?.items.orEmpty().mapNotNull { it.toSearch() }
+                  val hasNext = (res?.paginate?.currentPage ?: page) < (res?.paginate?.totalPage ?: page)
+                  return newHomePageResponse(HomePageList(request.name, items), hasNext)
+              }
+
+              override suspend fun search(query: String): List<SearchResponse>? {
+                  val res = app.get(
+                      "$mainUrl/api/films/search",
+                      params = mapOf("keyword" to query)
+                  ).parsedSafe<ListResponse>()
+                  return res?.items.orEmpty().mapNotNull { it.toSearch() }
+              }
+
+              // ---------- Detail ----------
+              override suspend fun load(url: String): LoadResponse? {
+                  val slug = url.trimEnd('/').substringAfterLast("/")
+                  val m = app.get("$mainUrl/api/film/$slug").parsedSafe<DetailResponse>()?.movie
+                      ?: return null
+
+                  // Gom các server theo tên tập
+                  val byEp = LinkedHashMap<String, MutableList<EpLink>>()
+                  for (server in m.episodes.orEmpty()) {
+                      for (l in server.items.orEmpty()) {
+                          val epName = l.name ?: continue
+                          byEp.getOrPut(epName) { mutableListOf() }
+                              .add(EpLink(server.serverName ?: "", l.embed, l.m3u8))
+                      }
+                  }
+
+                  val cats = parseCategory(m.category)
+                  val tags = cats.entries
+                      .filter { it.key.contains("Thể loại", true) }
+                      .flatMap { it.value }
+                  val year = cats.entries
+                      .firstOrNull { it.key.contains("Năm", true) }
+                      ?.value?.firstOrNull()?.toIntOrNull()
+                  val isSeries = (m.totalEpisodes ?: byEp.size) > 1 ||
+                      cats.values.flatten().any { it.contains("Phim bộ", true) }
+
+                  val title = m.name ?: slug
+                  val img = fixUrlNull(m.poster ?: m.thumb)
+                  val desc = m.description?.let { Jsoup.parse(it).text() }
+                  val minutes = m.time?.let { Regex("\\d+").find(it)?.value?.toIntOrNull() }
+                  val actors = m.casts?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+
+                  return if (isSeries) {
+                      val eps = byEp.map { (epName, links) ->
+                          newEpisode(links.toJson()) {
+                              name = if (epName.all { it.isDigit() }) "Tập $epName" else epName
+                              episode = Regex("\\d+").find(epName)?.value?.toIntOrNull()
+                          }
+                      }
+                      newTvSeriesLoadResponse(title, url, TvType.TvSeries, eps) {
+                          posterUrl = img
+                          plot = desc
+                          this.year = year
+                          this.tags = tags
+                          addActors(actors)
+                      }
+                  } else {
+                      val data = (byEp.values.firstOrNull() ?: emptyList<EpLink>()).toJson()
+                      newMovieLoadResponse(title, url, TvType.Movie, data) {
+                          posterUrl = img
+                          plot = desc
+                          this.year = year
+                          this.tags = tags
+                          duration = minutes
+                          addActors(actors)
+                      }
+                  }
+              }
+
+              // ---------- Links ----------
+              override suspend fun loadLinks(
+                  data: String,
+                  isCasting: Boolean,
+                  subtitleCallback: (SubtitleFile) -> Unit,
+                  callback: (ExtractorLink) -> Unit
+              ): Boolean {
+                  val links = tryParseJson<List<EpLink>>(data) ?: return false
+                  for (l in links) {
+                      if (!l.m3u8.isNullOrBlank()) {
+                          callback(
+                              newExtractorLink(
+                                  source = name,
+                                  name = "$name ${l.server}".trim(),
+                                  url = l.m3u8,
+                                  type = ExtractorLinkType.M3U8
+                              ) {
+                                  referer = mainUrl
+                                  quality = Qualities.Unknown.value
+                              }
+                          )
+                      } else if (!l.embed.isNullOrBlank()) {
+                          loadExtractor(l.embed, mainUrl, subtitleCallback, callback)
+                      }
+                  }
+                  return links.isNotEmpty()
+              }
+          }
+          NGUONC_EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add NguonC plugin source"
+          git push
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: Build plugin
+        run: gradle make makePluginsJson --stacktrace
+
+      - name: Publish nhánh builds
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir out
+          cp NguonC/build/*.cs3 out/
+          cp build/plugins.json out/
+          cat > out/repo.json <<EOF
+          {
+            "name": "NguonC",
+            "description": "Plugin CloudStream cho phim.nguonc.com",
+            "manifestVersion": 1,
+            "pluginLists": ["https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/builds/plugins.json"]
+          }
+          EOF
+          cd out
+          git init -q -b builds
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Build ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" builds
+          echo "Repo URL: https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/builds/repo.json"
